@@ -2,7 +2,7 @@
 
 ![alt text](<public/Screenshot 2025-12-16 at 7.17.15 PM.png>)
 
-WEBSITE LINK-[text](https://campus-care-three.vercel.app)
+WEBSITE LINK-https://campus-care-three.vercel.app
 
 > 🧠 **Hackathon Project**: A comprehensive digital mental health and psychological support system for students in higher education.
 
