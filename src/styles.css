@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,body,#root { height:100% }
+body { font-family: Inter, ui-sans-serif, system-ui; }
+
+.btn { display:inline-block; padding:0.5rem 0.75rem; background:#2563eb; color:white; border-radius:6px; }

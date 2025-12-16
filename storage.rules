@@ -1,0 +1,15 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Allow authenticated users to upload voice messages to their own folder
+    match /voice_messages/{userId}/{fileName} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+    
+    // Allow authenticated users to read voice messages (for counselors to access student messages)
+    match /voice_messages/{userId}/{fileName} {
+      allow read: if request.auth != null;
+    }
+  }
+}

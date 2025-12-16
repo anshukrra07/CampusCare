@@ -1,0 +1,409 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Allow users to read and write their own user documents and all subcollections
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+      
+      // Allow students to read counselor profiles from their institution
+      allow read: if request.auth != null && 
+        getUserData().role == 'student' &&
+        resource.data.role == 'counselor' &&
+        resource.data.institutionCode == getUserData().institutionCode;
+      
+      // Allow counselors to read other counselor profiles from their institution
+      allow read: if request.auth != null && 
+        getUserData().role == 'counselor' &&
+        resource.data.role == 'counselor' &&
+        resource.data.institutionCode == getUserData().institutionCode;
+      
+      // Allow users to read and write their own chat messages
+      match /chats/{messageId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      
+      // Allow users to read and write their own AI commands
+      match /ui_commands/{commandId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      
+      // Allow users to read and write their own alerts
+      // Also allow counselors to read alerts from users in their institution
+      match /alerts/{alertId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+        allow read: if request.auth != null && hasManagementRole();
+        allow write: if request.auth != null && hasManagementRole();
+      }
+      
+      // Allow users to read and write their own mood entries
+      match /moods/{moodId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      
+      // Allow users to read and write their own assessments
+      match /assessments/{assessmentId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      
+      // Allow users to read and write their own appointments
+      match /appointments/{appointmentId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      
+      // Allow users to read and write any other subcollection under their user document
+      match /{document=**} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+    }
+    
+    // Shared appointments collection (simplified permissions for better reliability)
+    match /appointments/{appointmentId} {
+      // Students can create appointments and read/update their own
+      allow create: if request.auth != null && 
+        getUserData().role == 'student' &&
+        request.resource.data.studentId == request.auth.uid;
+      
+      allow read, update: if request.auth != null && 
+        getUserData().role == 'student' &&
+        resource.data.studentId == request.auth.uid;
+      
+      // Counselors can read and update appointments from their institution
+      // Simplified: match by institution and let app logic handle counselor assignment
+      allow read, update: if request.auth != null && 
+        getUserData().role == 'counselor' &&
+        resource.data.institutionCode == getUserData().institutionCode;
+      
+    // Institution admins can read all appointments from their institution
+      allow read: if request.auth != null && 
+        getUserData().role == 'institution' &&
+        resource.data.institutionCode == getUserData().institutionCode;
+    }
+    
+    // Chat sessions between students and counselors
+    match /chats/{chatId} {
+      // Students can create chat sessions and read/write their own
+      allow create: if request.auth != null && 
+        getUserData().role == 'student' &&
+        request.resource.data.studentId == request.auth.uid;
+      
+      allow read, write: if request.auth != null && 
+        getUserData().role == 'student' &&
+        resource.data.studentId == request.auth.uid;
+      
+      // Counselors can read and write chats assigned to them from their institution
+      allow read, write: if request.auth != null && 
+        getUserData().role == 'counselor' &&
+        resource.data.institutionCode == getUserData().institutionCode;
+      
+      // Institution admins can read chats from their institution
+      allow read: if request.auth != null && 
+        getUserData().role == 'institution' &&
+        resource.data.institutionCode == getUserData().institutionCode;
+      
+      // Messages subcollection
+      match /messages/{messageId} {
+        // Students and counselors involved in the chat can read/write messages
+        allow read, write: if request.auth != null && (
+          (getUserData().role == 'student' && get(/databases/$(database)/documents/chats/$(chatId)).data.studentId == request.auth.uid) ||
+          (getUserData().role == 'counselor' && get(/databases/$(database)/documents/chats/$(chatId)).data.institutionCode == getUserData().institutionCode)
+        );
+      }
+    }
+    
+    // Allow authenticated users to read counselor data
+    match /counselors/{document=**} {
+      allow read: if request.auth != null;
+    }
+    
+    // Allow authenticated users to read and write crisis resources (public data)
+    match /crisisResources/{document=**} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null;
+    }
+    
+    // Get user data to check role and institution
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    
+    // Check if user belongs to the same institution as the student
+    function belongsToSameInstitution(studentData) {
+      let userData = getUserData();
+      return userData.institutionCode == studentData.institutionCode;
+    }
+    
+    // Check if user has institution or counselor role
+    function hasManagementRole() {
+      let userData = getUserData();
+      return userData.role == 'institution' || userData.role == 'counselor';
+    }
+    
+    // Get counselor data to check permissions
+    function getCounselorData(counselorId) {
+      return get(/databases/$(database)/documents/counselors/$(counselorId)).data;
+    }
+    
+    // Institution-based student management (nested under institutions)
+    match /institutions/{institutionId}/students/{studentId} {
+      // Allow read if authenticated user belongs to the same institution and has management role
+      allow read: if request.auth != null && hasManagementRole() && 
+        getUserData().institutionCode == institutionId;
+      
+      // Allow create and update if authenticated user belongs to the same institution and has management role
+      allow create, update: if request.auth != null && hasManagementRole() && 
+        getUserData().institutionCode == institutionId;
+      
+      // Allow delete only for institution admins (not counselors)
+      allow delete: if request.auth != null && 
+        getUserData().role == 'institution' &&
+        getUserData().institutionCode == institutionId;
+      
+      // Allow access to student sessions for counselors
+      match /sessions/{sessionId} {
+        allow read, write: if request.auth != null && hasManagementRole() && 
+          getUserData().institutionCode == institutionId;
+      }
+    }
+    
+    // Fallback for old student collection (for migration period)
+    match /students/{studentId} {
+      // Allow read if authenticated user belongs to same institution and has management role
+      allow read: if request.auth != null && hasManagementRole() && 
+        belongsToSameInstitution(resource.data);
+      
+      // Allow write if authenticated user belongs to same institution and has management role
+      // For creates, check the incoming data's institutionCode
+      allow write: if request.auth != null && hasManagementRole() && 
+        (resource == null || belongsToSameInstitution(resource.data)) &&
+        belongsToSameInstitution(request.resource.data);
+        
+      // Allow delete only for institution admins
+      allow delete: if request.auth != null && 
+        getUserData().role == 'institution' &&
+        belongsToSameInstitution(resource.data);
+    }
+    
+    // Institution-based counselor management (nested under institutions)
+    match /institutions/{institutionId}/counselors/{counselorId} {
+      // Allow read/write for institution admins of the same institution
+      allow read, write: if request.auth != null && 
+        getUserData().role == 'institution' &&
+        getUserData().institutionCode == institutionId;
+      
+      // Allow counselors to read their own profile
+      allow read: if request.auth != null && 
+        getUserData().role == 'counselor' &&
+        getUserData().institutionCode == institutionId;
+      
+      // Allow counselors to update their own profile (limited fields)
+      allow update: if request.auth != null && 
+        getUserData().role == 'counselor' &&
+        getUserData().institutionCode == institutionId &&
+        resource.data.email == getUserData().email;
+    }
+    
+    // Root-level counselor management
+    match /counselors/{counselorId} {
+      // Allow institution admins full access to counselors from their institution
+      allow read, create, update, delete: if request.auth != null && 
+        getUserData().role == 'institution' &&
+        (
+          // For creates, check the new document's institutionCode
+          (request.resource != null && request.resource.data.institutionCode == getUserData().institutionCode) ||
+          // For reads, updates, deletes, check the existing document's institutionCode
+          (resource != null && resource.data.institutionCode == getUserData().institutionCode)
+        );
+      
+      // Allow counselors to read counselors from their institution (for collaboration)
+      allow read: if request.auth != null && 
+        getUserData().role == 'counselor' &&
+        resource != null &&
+        resource.data.institutionCode == getUserData().institutionCode;
+      
+      // Allow counselors to update their own profile (limited fields)
+      allow update: if request.auth != null && 
+        getUserData().role == 'counselor' &&
+        resource != null &&
+        resource.data.institutionCode == getUserData().institutionCode &&
+        resource.data.email == getUserData().email;
+      
+      // Allow students to read counselors from their institution
+      allow read: if request.auth != null && 
+        getUserData().role == 'student' &&
+        resource != null &&
+        resource.data.institutionCode == getUserData().institutionCode;
+      
+      // Counselor's chats subcollection
+      match /chats/{chatId} {
+        // Allow counselors to read and write their own chats
+        allow read, write: if request.auth != null && 
+          getUserData().role == 'counselor' &&
+          get(/databases/$(database)/documents/counselors/$(counselorId)).data.uid == request.auth.uid;
+        
+        // Allow students to read chats where they are the participant
+        allow read, write: if request.auth != null && 
+          getUserData().role == 'student' &&
+          resource.data.studentId == request.auth.uid;
+        
+        // Allow students to create new chats with counselors
+        allow create: if request.auth != null && 
+          getUserData().role == 'student' &&
+          request.resource.data.studentId == request.auth.uid;
+        
+        // Messages subcollection within counselor chats
+        match /messages/{messageId} {
+          // Allow both counselor and student to read/write messages
+          allow read, write: if request.auth != null && (
+            (getUserData().role == 'counselor' && get(/databases/$(database)/documents/counselors/$(counselorId)).data.uid == request.auth.uid) ||
+            (getUserData().role == 'student' && get(/databases/$(database)/documents/counselors/$(counselorId)/chats/$(chatId)).data.studentId == request.auth.uid)
+          );
+        }
+      }
+      
+      // Counselor's appointments subcollection
+      match /appointments/{appointmentId} {
+        // Allow counselors to read and write their own appointments
+        allow read, write: if request.auth != null && 
+          getUserData().role == 'counselor' &&
+          getCounselorData(counselorId).email == getUserData().email;
+        
+        // Allow students to read appointments where they are the participant
+        allow read: if request.auth != null && 
+          getUserData().role == 'student' &&
+          resource.data.studentId == request.auth.uid;
+        
+        // Allow students to create new appointments with counselors
+        allow create: if request.auth != null && 
+          getUserData().role == 'student' &&
+          request.resource.data.studentId == request.auth.uid &&
+          getCounselorData(counselorId).institutionCode == getUserData().institutionCode;
+      }
+      
+      // Counselor's sessions subcollection
+      match /sessions/{sessionId} {
+        // Allow counselors to read and write their own sessions
+        allow read, write: if request.auth != null && 
+          getUserData().role == 'counselor' &&
+          getCounselorData(counselorId).email == getUserData().email;
+        
+        // Allow institution admins to read sessions from their institution
+        allow read: if request.auth != null && 
+          getUserData().role == 'institution' &&
+          getCounselorData(counselorId).institutionCode == getUserData().institutionCode;
+      }
+      
+      // Counselor's calls subcollection for WebRTC (simplified permissions)
+      match /calls/{callId} {
+        // Allow counselors to read and write calls in their own subcollection
+        allow read, write: if request.auth != null && 
+          getUserData().role == 'counselor';
+        
+        // Allow students to create and manage calls (they can only access counselor subcollections anyway)
+        allow read, write: if request.auth != null && 
+          getUserData().role == 'student';
+        
+        // ICE candidates subcollection
+        match /candidates/{candidateId} {
+          // Allow authenticated users to manage ICE candidates for calls
+          allow read, write: if request.auth != null && (
+            getUserData().role == 'counselor' || getUserData().role == 'student'
+          );
+        }
+      }
+    }
+    
+    // Institution documents - allow limited access for login validation and management
+    match /institutions/{institutionId} {
+      // Allow read access for login validation (even for unauthenticated users)
+      // This is needed to verify institution codes during login
+      allow read: if true;
+      
+      // Allow create during institution registration (for new institutions)
+      allow create: if request.auth != null && 
+        request.resource.data.institutionCode == institutionId;
+      
+      // Allow update by any authenticated institution user for that institution
+      // This is more flexible - any institution admin can update
+      allow update: if request.auth != null && 
+        getUserData().role == 'institution' &&
+        getUserData().institutionCode == institutionId;
+      
+      // Deny delete operations for security
+      allow delete: if false;
+    }
+    
+    // Collection group rules for appointments (allows students to query across all counselors)
+    match /{path=**}/appointments/{appointmentId} {
+      // Allow students to read their own appointments across all counselor subcollections
+      allow read: if request.auth != null && 
+        getUserData().role == 'student' &&
+        resource.data.studentId == request.auth.uid;
+    }
+    
+    // Collection group rules for chats (allows students to query across all counselors)
+    match /{path=**}/chats/{chatId} {
+      // Allow students to read their own chats across all counselor subcollections
+      allow read: if request.auth != null && 
+        getUserData().role == 'student' &&
+        resource.data.studentId == request.auth.uid;
+    }
+    
+    // Concern Reports - nested under institutions for better organization
+    match /institutions/{institutionId}/concernReports/{reportId} {
+      // Allow ANYONE (authenticated OR anonymous) to create concern reports
+      // This is crucial for anonymous reporting functionality
+      allow create: if true;
+      
+      // Allow counselors and institution admins to read reports from their institution
+      allow read: if request.auth != null && 
+        hasManagementRole() &&
+        getUserData().institutionCode == institutionId;
+      
+      // Allow counselors and institution admins to update report status and add notes
+      allow update: if request.auth != null && 
+        hasManagementRole() &&
+        getUserData().institutionCode == institutionId &&
+        // Only allow updates to specific fields for security
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(
+          ['status', 'assignedCounselor', 'notes', 'updatedAt', 'tags']
+        );
+      
+      // Don't allow deletion of concern reports for audit trail
+      allow delete: if false;
+    }
+    
+    // WebRTC Calls collection for voice and video calls
+    match /calls/{callId} {
+      // Allow users to create calls where they are the caller
+      allow create: if request.auth != null && 
+        request.resource.data.callerId == request.auth.uid;
+      
+      // Allow call participants (caller or callee) to read and update calls
+      allow read, update: if request.auth != null && (
+        resource.data.callerId == request.auth.uid ||
+        resource.data.calleeId == request.auth.uid
+      );
+      
+      // Allow participants to delete calls (for cleanup)
+      allow delete: if request.auth != null && (
+        resource.data.callerId == request.auth.uid ||
+        resource.data.calleeId == request.auth.uid
+      );
+      
+      // ICE candidates subcollection
+      match /candidates/{candidateId} {
+        // Allow call participants to read and write ICE candidates
+        allow read, write: if request.auth != null && (
+          get(/databases/$(database)/documents/calls/$(callId)).data.callerId == request.auth.uid ||
+          get(/databases/$(database)/documents/calls/$(callId)).data.calleeId == request.auth.uid
+        );
+      }
+    }
+    
+    // Default deny for all other documents
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

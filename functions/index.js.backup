@@ -1,0 +1,1531 @@
+// index.js (Cloud Functions) - Optimized Modular Structure
+require("dotenv").config();
+const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/firestore");
+const { onRequest } = require("firebase-functions/v2/https");
+const { getFirestore } = require("firebase-admin/firestore");
+const { initializeApp } = require("firebase-admin/app");
+
+// Import modular services
+const { analyzeEmotion, quickEmotionCheck } = require('./services/emotionService');
+const { 
+  detectCrisis, 
+  generateCrisisResponse, 
+  createCrisisAlert, 
+  createCrisisResponseMeta,
+  quickCrisisCheck
+} = require('./services/crisisService');
+const { 
+  getUserProfileContext, 
+  getChatContext, 
+  getUserCompleteContext 
+} = require('./services/contextService');
+const { 
+  transcribeBase64Audio, 
+  synthesizeAudioBase64, 
+  generateTTSAsync, 
+  validateAudioInput 
+} = require('./services/audioService');
+const { 
+  detectIntent, 
+  getResponseStrategy, 
+  buildContextPlan 
+} = require('./services/intentService');
+const { genTextFromGemini, generateFallbackResponse } = require('./utils/helpers');
+const { PROMPTS } = require('./config/prompts');
+const { REGION } = require('./config/constants');
+
+// Initialize Firebase Admin
+initializeApp();
+const db = getFirestore();
+
+// 🔄 AUTO-REFRESH CACHE TRIGGERS (all in asia-south1 region)
+
+// Cache refresh triggers use the modular services
+
+    // 5️⃣ Alerts
+    const alertsSnap = await db.collection("users").doc(userId).collection("alerts")
+      .orderBy("created_at", "desc").limit(10).get();
+    if (!alertsSnap.empty) {
+      console.log(`🚨 Found ${alertsSnap.docs.length} alerts`);
+      profileSummary.alertSummary = alertsSnap.docs.map(d => {
+        const alert = d.data();
+        const date = alert.created_at?.toDate?.()?.toDateString() || "Unknown date";
+        return `${alert.reason} (${date})`;
+      }).join("; ");
+    }
+
+    // 6️⃣ Appointments (from user subcollection) - recent 10
+    try {
+      const apptSnap = await db.collection('users').doc(userId).collection('appointments')
+        .limit(10).get();
+      
+      console.log(`📅 Raw appointment query returned ${apptSnap.docs.length} documents`);
+      
+      if (!apptSnap.empty) {
+        const appointmentDetails = apptSnap.docs.map(d => {
+          const data = d.data();
+          console.log(`📅 Appointment doc ${d.id}:`, data);
+          
+          // Extract detailed appointment info
+          const counselor = data.counselorName || data.counselor || data.doctor || "Counselor";
+          const date = data.scheduledDate || data.date || data.appointmentDate || "Unknown date";
+          const time = data.scheduledTime || data.time || "Time TBD";
+          const type = data.type || "in-person";
+          const status = data.status || "scheduled";
+          const notes = data.notes ? ` | Notes: "${data.notes.slice(0, 40)}..."` : '';
+          // Handle specialties - could be string or array
+          let specialties = '';
+          if (data.counselorSpecialties) {
+            if (Array.isArray(data.counselorSpecialties)) {
+              specialties = ` | Specialties: ${data.counselorSpecialties.join(', ')}`;
+            } else if (typeof data.counselorSpecialties === 'string' && data.counselorSpecialties.trim()) {
+              specialties = ` | Specialties: ${data.counselorSpecialties}`;
+            }
+          }
+          
+          // Format meeting type with emoji
+          let meetingType;
+          switch(type.toLowerCase()) {
+            case 'video':
+              meetingType = '📹 Video call';
+              break;
+            case 'phone':
+              meetingType = '📞 Phone call';
+              break;
+            case 'in-person':
+            case 'office':
+              meetingType = '🏢 In-person';
+              break;
+            default:
+              meetingType = type;
+          }
+          
+          // Format status with emoji
+          let statusEmoji;
+          switch(status.toLowerCase()) {
+            case 'confirmed':
+              statusEmoji = '✅';
+              break;
+            case 'pending':
+              statusEmoji = '⏳';
+              break;
+            case 'cancelled':
+              statusEmoji = '❌';
+              break;
+            default:
+              statusEmoji = '📅';
+          }
+          
+          return `${statusEmoji} ${counselor} | ${date} at ${time} | ${meetingType}${specialties}${notes}`;
+        }).join('; ');
+        
+        // Count appointment types
+        const types = apptSnap.docs.map(d => d.data().type || 'in-person');
+        const typeCounts = {};
+        types.forEach(type => typeCounts[type] = (typeCounts[type] || 0) + 1);
+        const typesSummary = Object.keys(typeCounts).map(type => `${typeCounts[type]} ${type}`).join(', ');
+        
+        profileSummary.appointmentsSummary = `${appointmentDetails} | Total: ${apptSnap.docs.length} appointments (${typesSummary})`;
+        console.log(`📅 Enhanced appointment summary: ${profileSummary.appointmentsSummary}`);
+      } else {
+        console.log('📅 No appointment documents found');
+      }
+    } catch (apptErr) {
+      console.error('❌ Appointments fetch failed:', apptErr);
+    }
+
+    // ✅ Save to profile cache
+    await profileCacheRef.set(profileSummary);
+    console.log("💾 Cached new profile summary");
+    console.log(`📈 Profile Summary Generated:`);
+    console.log(`   - Assessments: ${profileSummary.assessmentSummary}`);
+    console.log(`   - Alerts: ${profileSummary.alertSummary}`);
+
+    return profileSummary;
+
+  } catch (error) {
+    console.error("❌ Error in getUserProfileContext:", error);
+    return {
+      profileSummary: "Error",
+      assessmentSummary: "",
+      moodSummary: "", 
+      alertSummary: "",
+      appointmentsSummary: "",
+      updatedAt: new Date(),
+    };
+  }
+}
+
+// 💬 Get Last 6 Messages Completely (with emotions)
+async function getChatContext(userId) {
+  try {
+    const chatsSnap = await db.collection("users").doc(userId).collection("chats")
+      .orderBy("created_at", "desc").limit(6).get();
+    
+    if (chatsSnap.empty) {
+      return "No recent chats";
+    }
+    
+    // Get last 6 messages completely with emotion data
+    const chats = chatsSnap.docs.reverse().map(d => {
+      const data = d.data();
+      const emotion = data.meta?.emotion;
+      let emotionInfo = '';
+      
+      if (emotion) {
+        emotionInfo = ` [${emotion.emotion}:${emotion.intensity}%]`;
+      }
+      
+      return `${data.role}: ${data.text}${emotionInfo}`;
+    }).join(" | ");
+    
+    return chats;
+    
+  } catch (error) {
+    console.error("❌ Error getting chat context:", error);
+    return "";
+  }
+}
+
+// 📊 Fast Combined User Context 
+async function getUserCompleteContext(userId, { forceRefresh = false } = {}) {
+  try {
+    // Run profile and chat context in parallel for speed
+    const [profileContext, chatSummary] = await Promise.all([
+      getUserProfileContext(userId, { forceRefresh }),
+      getChatContext(userId)
+    ]);
+    
+    return {
+      ...profileContext,
+      chatSummary
+    };
+    
+  } catch (error) {
+    console.error("❌ Error in getUserCompleteContext:", error);
+    return {
+      profileSummary: "Error",
+      assessmentSummary: "",
+      moodSummary: "",
+      alertSummary: "",
+      appointmentsSummary: "",
+      chatSummary: ""
+    };
+  }
+}
+
+
+// ----------------- helpers -----------------
+async function genTextFromGemini(prompt, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`Gemini API attempt ${attempt}/${maxRetries}`);
+      
+      // Try flash-lite as primary, flash as fallback on final attempt
+      const activeModel = (attempt === maxRetries) ? model : fallbackModel;
+      const modelName = (attempt === maxRetries) ? "gemini-2.5-flash" : "gemini-2.5-flash-lite";
+      console.log(`Using model: ${modelName}`);
+      
+      const resp = await activeModel.generateContent(prompt);
+
+      // try several fields (library returns different shapes in examples)
+      const text =
+        resp?.response?.text?.() ||
+        resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
+        (Array.isArray(resp?.response?.candidates) &&
+          resp.response.candidates[0]?.content?.parts?.map((p) => p.text).join("")) ||
+        "";
+      
+      // Return both text and model info
+      return {
+        text: (text || "").toString(),
+        model: modelName,
+        attempt: attempt
+      };
+    } catch (error) {
+      console.warn(`Gemini API attempt ${attempt} failed:`, error.message);
+      
+      // If it's a service overload error and we have retries left, wait and retry
+      if (error.message.includes('overloaded') || error.message.includes('503')) {
+        if (attempt < maxRetries) {
+          const waitTime = attempt * 1500; // Shorter backoff: 1.5s, 3s, 4.5s
+          console.log(`Waiting ${waitTime}ms before retry...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+          continue;
+        }
+      }
+      
+      // If it's the last attempt or a different error, throw
+      throw error;
+    }
+  }
+}
+
+async function transcribeBase64Audio(base64, mimeType = "audio/webm") {
+  // choose encoding by mime — adjust if you send different blobs
+  let encoding = "WEBM_OPUS";
+  if (mimeType.includes("wav")) encoding = "LINEAR16";
+  if (mimeType.includes("ogg")) encoding = "OGG_OPUS";
+  // sample rate typical for MediaRecorder on modern browsers
+  const sampleRateHertz = 48000;
+
+  const request = {
+    audio: { content: base64 },
+    config: {
+      encoding,
+      sampleRateHertz,
+      languageCode: "en-US",
+      enableAutomaticPunctuation: true,
+    },
+  };
+
+  const [response] = await speechClient.recognize(request);
+  if (!response || !response.results) return "";
+  const transcript = response.results
+    .map((r) => r.alternatives?.[0]?.transcript || "")
+    .join(" ");
+  return transcript;
+}
+
+async function synthesizeAudioBase64(text) {
+  const [response] = await ttsClient.synthesizeSpeech({
+    input: { text },
+    voice: { languageCode: "en-US", name: "en-US-Wavenet-D" }, // change voice if you want
+    audioConfig: { audioEncoding: "MP3" },
+  });
+  const audioBase64 = Buffer.from(response.audioContent).toString("base64");
+  return audioBase64;
+}
+
+// ----------------- HTTP: processVoice -----------------
+// POST JSON { userId, audioBase64, mimeType }
+// Returns { transcript, assistantText, assistantAudio (base64), emotion }
+// 🔄 AUTO-REFRESH CACHE TRIGGERS (all in asia-south1 region)
+// Refresh PROFILE cache when assessment is added/updated
+exports.refreshCacheOnAssessment = onDocumentCreated(
+  {
+    document: 'users/{userId}/assessments/{assessmentId}',
+    region: 'asia-south1'
+  },
+  async (event) => {
+    const userId = event.params.userId;
+    console.log(`🎯 Assessment added for ${userId}, refreshing PROFILE cache...`);
+    await getUserProfileContext(userId, { forceRefresh: true });
+  }
+);
+
+// Refresh PROFILE cache when alert is added
+exports.refreshCacheOnAlert = onDocumentCreated(
+  {
+    document: 'users/{userId}/alerts/{alertId}',
+    region: 'asia-south1'
+  },
+  async (event) => {
+    const userId = event.params.userId;
+    console.log(`🚨 Alert added for ${userId}, refreshing PROFILE cache...`);
+    await getUserProfileContext(userId, { forceRefresh: true });
+  }
+);
+
+// Refresh PROFILE cache when mood entry is added OR updated
+exports.refreshCacheOnMoodCreated = onDocumentCreated(
+  {
+    document: 'users/{userId}/moods/{moodId}',
+    region: 'asia-south1'
+  },
+  async (event) => {
+    const userId = event.params.userId;
+    console.log(`😊 Mood entry created for ${userId}, refreshing PROFILE cache...`);
+    await getUserProfileContext(userId, { forceRefresh: true });
+  }
+);
+
+// Also listen for mood updates (when same day mood is updated)
+exports.refreshCacheOnMoodUpdated = onDocumentUpdated(
+  {
+    document: 'users/{userId}/moods/{moodId}',
+    region: 'asia-south1'
+  },
+  async (event) => {
+    const userId = event.params.userId;
+    console.log(`😊 Mood entry updated for ${userId}, refreshing PROFILE cache...`);
+    await getUserProfileContext(userId, { forceRefresh: true });
+  }
+);
+
+// Refresh PROFILE cache when appointment is added/updated
+exports.refreshCacheOnAppointment = onDocumentCreated(
+  {
+    document: 'users/{userId}/appointments/{appointmentId}',
+    region: 'asia-south1'
+  },
+  async (event) => {
+    const userId = event.params.userId;
+    console.log(`📅 Appointment added for ${userId}, refreshing PROFILE cache...`);
+    await getUserProfileContext(userId, { forceRefresh: true });
+  }
+);
+
+// Refresh cache when user profile is updated
+exports.refreshCacheOnProfile = onDocumentUpdated(
+  {
+    document: 'users/{userId}',
+    region: 'asia-south1'
+  },
+  async (event) => {
+    const userId = event.params.userId;
+    const beforeData = event.data?.before?.data();
+    const afterData = event.data?.after?.data();
+    
+    // Only refresh if meaningful profile data changed
+    const profileFields = ['displayName', 'name', 'gender', 'birthDate', 'interests', 'hobbies', 'role', 'email'];
+    const hasProfileChange = profileFields.some(field => beforeData?.[field] !== afterData?.[field]);
+    
+    if (hasProfileChange) {
+      console.log(`👤 Profile updated for ${userId}, refreshing PROFILE cache...`);
+      console.log(`Changed fields: ${profileFields.filter(f => beforeData?.[f] !== afterData?.[f]).join(', ')}`);
+      await getUserProfileContext(userId, { forceRefresh: true });
+    } else {
+      console.log(`👤 Non-profile update for ${userId}, skipping cache refresh`);
+    }
+  }
+);
+
+exports.processVoice = onRequest({ region: "asia-south1", cors: true }, async (req, res) => {
+  // Set CORS headers
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  
+  // Handle preflight OPTIONS request
+  if (req.method === 'OPTIONS') {
+    return res.status(204).send('');
+  }
+  
+  if (req.method !== "POST") return res.status(405).send("Method not allowed");
+  try {
+    const { userId, audioBase64, mimeType } = req.body || {};
+    if (!userId || !audioBase64) return res.status(400).send("Missing userId or audioBase64");
+
+    // 1) Transcribe audio -> text
+    console.log("processVoice: transcribing...");
+    const transcript = await transcribeBase64Audio(audioBase64, mimeType || "audio/webm");
+    console.log("processVoice: transcript:", transcript);
+    
+    // Debug: Immediate crisis check
+    const immediateKeywordCheck = RISK_KEYWORDS.find((k) => transcript.toLowerCase().includes(k));
+    if (immediateKeywordCheck) {
+      console.log(`🚨 IMMEDIATE CRISIS DETECTED in voice: "${immediateKeywordCheck}" from transcript: "${transcript}"`);
+    }
+
+    // 2) Save user message (mark processedBy so onChatMessage won't process it)
+    await db
+      .collection("users")
+      .doc(userId)
+      .collection("chats")
+      .add({
+        role: "user",
+        text: transcript,
+        created_at: new Date(),
+        meta: { processedBy: "processVoice" },
+      });
+
+    // 3) PARALLEL PROCESSING: AI Moderation + Emotion Analysis (same as text)
+    console.log("Starting parallel voice analysis: moderation + emotion...");
+    
+    const moderationPromise = (async () => {
+      try {
+        const moderationPrompt = `Classify this voice transcript for self-harm or suicide risk.
+           Respond ONLY with one word: high or safe.
+           Transcript: "${transcript}"`;
+        const moderationResult = await genTextFromGemini(moderationPrompt, 2);
+
+        let riskLevel = moderationResult?.text?.toLowerCase().trim() || "safe";
+        if (!["high", "safe"].includes(riskLevel)) riskLevel = "safe";
+        return riskLevel;
+      } catch (err) {
+        console.error("⚠️ Voice Gemini moderation failed:", err);
+        // Enhanced keyword matching with logging
+        const transcriptLower = transcript.toLowerCase();
+        const matchedKeyword = RISK_KEYWORDS.find((k) => transcriptLower.includes(k));
+        const isHighRisk = !!matchedKeyword;
+        
+        if (matchedKeyword) {
+          console.log(`🚨 CRISIS KEYWORD DETECTED in voice: "${matchedKeyword}" from transcript: "${transcript}"`);
+        }
+        
+        return isHighRisk ? "high" : "safe";
+      }
+    })();
+    
+    const emotionPromise = (async () => {
+      const emoPrompt = `You are an emotion detection AI. Analyze this message and respond with ONLY valid JSON:
+
+{"emotion": "<emotion>", "intensity": <number>, "notes": "<brief reason>"}
+
+Emotion categories: happy, sad, anxious, angry, excited, frustrated, depressed, suicidal, neutral
+Intensity: 0-100 (0=barely detectable, 100=extremely intense)
+
+Examples:
+- "I am very happy" → {"emotion": "happy", "intensity": 85, "notes": "clearly expressing happiness"}
+- "I feel okay" → {"emotion": "neutral", "intensity": 30, "notes": "mild positive sentiment"}
+- "I want to die" → {"emotion": "suicidal", "intensity": 95, "notes": "crisis situation"}
+
+Analyze: "${transcript}"`;
+      let emotionData = { emotion: "neutral", intensity: 0, notes: "" };
+      let emotionModel = "keyword-fallback";
+      
+      try {
+        const emoResult = await genTextFromGemini(emoPrompt, 2); // 2 attempts for accuracy
+        emotionModel = emoResult.model;
+        try {
+          const parsed = JSON.parse(emoResult.text);
+          // Normalize emotion labels
+          const e = (parsed.emotion || '').toLowerCase();
+          const map = {
+            joyful: 'happy', joy: 'happy', pleased: 'happy', delighted: 'happy', glad: 'happy',
+            unhappy: 'sad', sorrow: 'sad', down: 'sad',
+            nervous: 'anxious', worried: 'anxious', stressed: 'anxious',
+            mad: 'angry', upset: 'angry', irritated: 'angry', frustrated: 'frustrated',
+            excited: 'excited', thrilled: 'excited',
+            depressed: 'depressed', hopeless: 'depressed',
+            suicidal: 'suicidal', selfharm: 'suicidal', 'self-harm': 'suicidal'
+          };
+          const normalized = map[e] || e;
+          emotionData = {
+            emotion: ['happy','sad','anxious','angry','excited','frustrated','depressed','suicidal','neutral'].includes(normalized) ? normalized : 'neutral',
+            intensity: Math.max(0, Math.min(100, Number(parsed.intensity ?? 50))),
+            notes: parsed.notes || ''
+          };
+          // If transcript clearly expresses strong positivity, boost intensity
+          const positiveBoost = /(very|so|extremely)\s+(happy|glad|excited|good|great)/i.test(transcript);
+          if (emotionData.emotion === 'happy' && positiveBoost && emotionData.intensity < 70) {
+            emotionData.intensity = 80;
+            emotionData.notes = emotionData.notes || 'strong positive language detected';
+          }
+        } catch (parseErr) {
+          // Quick keyword fallback with positive detection
+          const t = transcript.toLowerCase();
+          const crisisHit = RISK_KEYWORDS.some((k) => t.includes(k));
+          if (crisisHit) {
+            emotionData = { emotion: 'suicidal', intensity: 95, notes: 'Crisis keywords detected' };
+          } else if (/\b(happy|glad|excited|great|amazing)\b/.test(t)) {
+            const booster = /(very|so|extremely)/.test(t) ? 85 : 70;
+            emotionData = { emotion: 'happy', intensity: booster, notes: 'Positive sentiment keywords' };
+          } else {
+            emotionData = { emotion: 'neutral', intensity: 40, notes: 'Parse failed' };
+          }
+        }
+      } catch (err) {
+        // Quick keyword check without AI - include positive sentiment detection
+        const t = transcript.toLowerCase();
+        const crisisHit = RISK_KEYWORDS.some((k) => t.includes(k));
+        if (crisisHit) {
+          emotionData = { emotion: "suicidal", intensity: 95, notes: "keyword match" };
+          emotionModel = "crisis-keyword-fallback";
+        } else if (/\b(very|so|extremely)\s+(happy|glad|excited|good|great)/i.test(transcript)) {
+          emotionData = { emotion: "happy", intensity: 85, notes: "strong positive keywords" };
+          emotionModel = "positive-keyword-fallback";
+        } else if (/\b(happy|glad|excited|great|amazing|wonderful|fantastic|awesome|love|enjoy)/i.test(transcript)) {
+          emotionData = { emotion: "happy", intensity: 70, notes: "positive keywords" };
+          emotionModel = "positive-keyword-fallback";
+        } else if (/\b(sad|depressed|down|awful|terrible|horrible|hate|upset|crying)/i.test(transcript)) {
+          emotionData = { emotion: "sad", intensity: 70, notes: "negative keywords" };
+          emotionModel = "negative-keyword-fallback";
+        } else {
+          emotionData = { emotion: "neutral", intensity: 30, notes: "AI failed, no clear emotional indicators" };
+          emotionModel = "error-fallback";
+        }
+      }
+      return { emotionData, emotionModel };
+    })();
+
+
+    // Wait for both moderation and emotion analysis (same as text)
+    console.log("Waiting for parallel voice analysis to complete...");
+    const [riskLevel, emotionResult] = await Promise.all([moderationPromise, emotionPromise]);
+    const { emotionData, emotionModel } = emotionResult;
+    
+    // 5) AI-POWERED INTENT DETECTION: Same as text chat
+    console.log('🤖 Using AI to analyze voice transcript for context needs...');
+    
+    let intentResult = {
+      needsAssessments: false,
+      needsMoods: false, 
+      needsAppointments: false,
+      needsAlerts: false,
+      needsSummary: false,
+      needsProfile: false
+    };
+    
+    try {
+      const intentPrompt = `You are an intent detection system for a mental health app. Analyze the user's voice transcript and determine what data they need.
+
+RESPOND WITH ONLY THIS EXACT JSON FORMAT (no extra text):
+{"needsAssessments": false, "needsMoods": false, "needsAppointments": false, "needsAlerts": false, "needsSummary": false, "needsProfile": false}
+
+Set to true if user needs:
+- needsAssessments: asking about test scores, PHQ-9, GAD-7, assessments, results, progress, "how am I doing"
+- needsMoods: asking about feelings, emotions, mood tracking, "how have I felt"
+- needsAppointments: asking about therapy sessions, counselor meetings, scheduling
+- needsAlerts: asking about crisis history, previous emergencies
+- needsSummary: asking for overall summary, overview, progress report, "how am I overall", "give me a summary"
+- needsProfile: asking about personal information, "what's my name", "what are my interests", "tell me about myself"
+
+Voice transcript: "${transcript}"`;
+      
+      const intentAI = await genTextFromGemini(intentPrompt, 2);
+      console.log('🤖 Raw AI voice intent response:', intentAI.text);
+      
+      // Clean the response - remove any extra text before/after JSON
+      let cleanJson = intentAI.text.trim();
+      const jsonStart = cleanJson.indexOf('{');
+      const jsonEnd = cleanJson.lastIndexOf('}') + 1;
+      if (jsonStart !== -1 && jsonEnd > jsonStart) {
+        cleanJson = cleanJson.substring(jsonStart, jsonEnd);
+      }
+      
+      const parsed = JSON.parse(cleanJson);
+      intentResult = {
+        needsAssessments: !!parsed.needsAssessments,
+        needsMoods: !!parsed.needsMoods,
+        needsAppointments: !!parsed.needsAppointments, 
+        needsAlerts: !!parsed.needsAlerts,
+        needsSummary: !!parsed.needsSummary,
+        needsProfile: !!parsed.needsProfile
+      };
+      
+      console.log('✅ Voice AI intent detection result:', intentResult);
+      
+    } catch (err) {
+      console.warn('⚠️ Voice AI intent detection failed, using keyword fallback:', err);
+      // Fallback to basic keyword detection if AI fails
+      intentResult = {
+        needsAssessments: /\b(assessment|test|score|result|phq|gad|exam)\b/i.test(transcript),
+        needsMoods: /\b(mood|feeling|emotion|how.*feel|track)\b/i.test(transcript),
+        needsAppointments: /\b(appointment|session|meeting|counselor|therapist|schedule)\b/i.test(transcript),
+        needsAlerts: /\b(alert|crisis|emergency|help|urgent)\b/i.test(transcript),
+        needsSummary: /\b(summary|overview|progress|overall|how.*doing|report)\b/i.test(transcript),
+        needsProfile: /\b(name|interest|hobby|about me|who am i|my name|my interest)\b/i.test(transcript)
+      };
+    }
+    
+    const { needsAssessments, needsMoods, needsAppointments, needsAlerts, needsSummary, needsProfile } = intentResult;
+    
+    // 6) ALWAYS load last 6 chats for better conversation flow
+    console.log('💬 Loading last 6 chats for voice conversation context...');
+    const chatContext = await getChatContext(userId);
+    
+    // Build context object with requested data
+    let contextData = { chats: chatContext };
+    let contextSections = [];
+    let responseModel = "basic-voice";
+    
+    // Check if specific data is needed beyond chat history
+    if (needsAssessments || needsMoods || needsAppointments || needsAlerts || needsSummary || needsProfile) {
+      console.log('📊 Loading specific context data for voice...');
+      responseModel = "enhanced-voice-context";
+      
+      // Load only what's needed in parallel
+      const promises = [];
+      
+      if (needsAssessments || needsSummary) {
+        console.log(needsAssessments ? '  - Loading assessments...' : '  - Loading assessments for voice summary...');
+        promises.push(
+          (async () => {
+            const profileContext = await getUserProfileContext(userId);
+            contextData.assessments = profileContext.assessmentSummary;
+            contextSections.push(`ASSESSMENT HISTORY: ${profileContext.assessmentSummary}`);
+          })()
+        );
+      }
+      
+      if (needsMoods || needsSummary) {
+        console.log(needsMoods ? '  - Loading moods...' : '  - Loading moods for voice summary...');
+        promises.push(
+          (async () => {
+            const profileContext = await getUserProfileContext(userId);
+            contextData.moods = profileContext.moodSummary;
+            contextSections.push(`RECENT MOODS: ${profileContext.moodSummary}`);
+          })()
+        );
+      }
+      
+      if (needsAppointments || needsSummary) {
+        console.log(needsAppointments ? '  - Loading appointments...' : '  - Loading appointments for voice summary...');
+        promises.push(
+          (async () => {
+            const profileContext = await getUserProfileContext(userId);
+            contextData.appointments = profileContext.appointmentsSummary;
+            contextSections.push(`APPOINTMENTS: ${profileContext.appointmentsSummary}`);
+          })()
+        );
+      }
+      
+      if (needsAlerts || needsSummary) {
+        console.log(needsAlerts ? '  - Loading alerts...' : '  - Loading alerts for voice summary...');
+        promises.push(
+          (async () => {
+            const profileContext = await getUserProfileContext(userId);
+            contextData.alerts = profileContext.alertSummary;
+            contextSections.push(`CRISIS ALERTS: ${profileContext.alertSummary}`);
+          })()
+        );
+      }
+      
+      if (needsProfile || needsSummary) {
+        console.log(needsProfile ? '  - Loading profile information...' : '  - Loading profile for voice summary...');
+        promises.push(
+          (async () => {
+            const profileContext = await getUserProfileContext(userId);
+            contextData.profile = profileContext.profileSummary;
+            contextSections.push(`PERSONAL PROFILE: ${profileContext.profileSummary}`);
+          })()
+        );
+      }
+      
+      // Wait for all requested data
+      await Promise.all(promises);
+    }
+    
+    // 7) Generate response using emotion context and smart data loading
+    console.log("Generating smart voice response with context...");
+    
+    let messages;
+    if (contextSections.length > 0) {
+      const contextString = contextSections.join('\n\n');
+      
+      if (needsSummary) {
+        responseModel = "comprehensive-voice-summary";
+        messages = `
+You are a mental health counselor providing a comprehensive summary response to a voice message.
+
+VOICE TRANSCRIPT: "${transcript}"
+DETECTED EMOTION: ${emotionData.emotion} (${emotionData.intensity}% intensity)
+
+COMPREHENSIVE USER DATA:
+${contextString}
+
+RECENT CONVERSATIONS: ${chatContext}
+
+PROVIDE A COMPREHENSIVE VOICE-FRIENDLY SUMMARY:
+1. Overall mental health progress and trends
+2. Assessment scores and improvements/declines
+3. Mood patterns and emotional well-being
+4. Crisis alerts or concerning patterns
+5. Appointment attendance and engagement
+6. Key insights and recommendations
+7. Be supportive and encouraging while being honest about progress
+8. IMPORTANT: Use emotion data to inform tone, but don't mention emotions or percentages explicitly
+9. Keep response conversational for voice - avoid overly clinical language
+
+Counselor:`;
+      } else {
+        messages = `
+You are a supportive mental health counselor responding to a voice message with access to relevant user data.
+
+VOICE TRANSCRIPT: "${transcript}"
+DETECTED EMOTION: ${emotionData.emotion} (${emotionData.intensity}% intensity)
+
+RELEVANT USER DATA:
+${contextString}
+
+RECENT CONVERSATIONS: ${chatContext}
+
+RESPONSE INSTRUCTIONS:
+1. Use conversation history to maintain continuity
+2. Use the provided relevant data to answer their specific question
+3. Be specific and direct - if they ask for scores, provide exact scores and dates
+4. Be supportive while providing the requested information
+5. Use emotion data to adjust tone - be gentle if distressed, but don't mention emotions explicitly
+6. Keep it conversational and voice-friendly
+7. Reference previous conversations when relevant
+
+Counselor:`;
+      }
+    } else {
+      responseModel = "conversational-voice";
+      messages = `
+You are a supportive mental health counselor responding to a voice message.
+
+VOICE TRANSCRIPT: "${transcript}"
+DETECTED EMOTION: ${emotionData.emotion} (${emotionData.intensity}% intensity)
+
+RECENT CONVERSATION HISTORY: ${chatContext}
+
+Provide a warm, supportive voice response that:
+1. References previous conversations when relevant for continuity
+2. Uses emotion data to inform your tone and approach (be gentle if they seem distressed)
+3. Offers encouragement and validation
+4. Asks thoughtful follow-up questions
+5. Shows empathy and understanding
+6. Maintains the flow of your ongoing conversation
+7. IMPORTANT: Don't explicitly mention emotions, percentages, or intensity levels - just let them inform your response naturally
+8. Keep it conversational and natural for voice interaction
+
+Counselor:`;
+    }
+    
+    const responsePromise = (async () => {
+      try {
+        const assistantResult = await genTextFromGemini(messages, 2);
+        return {
+          assistantText: assistantResult.text.trim(),
+          responseModel: assistantResult.model
+        };
+      } catch (err) {
+        console.warn("Voice assistant response generation failed:", err);
+        const fallbackText = err.message.includes('overloaded')
+          ? `Thank you for sharing. I'm experiencing high demand right now, but I heard you. What would you like to talk about?`
+          : `I heard you. Tell me more about what's on your mind.`;
+        return {
+          assistantText: fallbackText,
+          responseModel: "voice-fallback"
+        };
+      }
+    })();
+    
+    // Wait for response generation
+    console.log("Waiting for smart voice response generation...");
+    const responseResult = await responsePromise;
+    
+    const { assistantText, responseModel: aiResponseModel } = responseResult;
+
+    // 4) Enhanced crisis detection (same logic as text processing)
+    console.log("Checking for voice crisis conditions...");
+    const riskLabels = ["suicide", "suicidal", "kill", "kill myself", "die", "death", "hopeless"];
+    const crisisEmotions = ["suicidal", "depressed", "hopeless"];
+    const isHighRiskKeyword = riskLevel === "high"; // AI moderation result
+    const isCrisisEmotion = emotionData.emotion && crisisEmotions.includes(emotionData.emotion.toLowerCase());
+    
+    // Crisis support only for:
+    // 1. Messages flagged as high-risk by AI moderation (isHighRiskKeyword)
+    // 2. Suicidal/depressed emotions with high intensity (>= 80)
+    // 3. Any emotion with extremely high crisis intensity (>= 95)
+    const shouldTriggerCrisis = isHighRiskKeyword || 
+                               (isCrisisEmotion && emotionData.intensity >= 80) ||
+                               (emotionData.intensity >= 95);
+    
+    if (shouldTriggerCrisis) {
+      console.log(`🚨 HIGH RISK DETECTED in voice for user ${userId}: "${transcript}"`);
+      console.log(`Crisis triggers: aiModeration=${isHighRiskKeyword}, crisisEmotion=${isCrisisEmotion}, extremeIntensity=${emotionData.intensity >= 95}`);
+      console.log(`Emotion: ${emotionData.emotion} (intensity: ${emotionData.intensity})`);
+      console.log(`AI Moderation: ${riskLevel}`);
+      
+      // Generate personalized crisis response using AI (same as text processing)
+      let crisisResponse = "";
+      try {
+        const crisisPrompt = `You are a crisis counselor responding to someone in distress via voice message. The person said: "${transcript}"
+
+Provide a comprehensive, compassionate crisis response that:
+1. Opens with warmth and acknowledgment of their courage to reach out
+2. Validates their pain without judgment - acknowledge how much they're hurting
+3. Provide specific crisis resources:
+   - **988** for US/Canada Suicide & Crisis Lifeline (available 24/7)
+   - **111** for UK urgent mental health support
+   - **116 123** for Samaritans in UK (available 24/7)
+   - Crisis Text Line: text HOME to 741741 (available 24/7)
+4. Emphasize that these feelings are treatable and there are people who want to help
+5. Ask a gentle, caring follow-up question to keep them talking
+6. Reassure them they're not alone and that you're here to listen
+7. Use a warm, steady voice tone - be direct but extremely compassionate
+8. Include phrases like "I'm so sorry you're going through this" and "These feelings, even though they're overwhelming, are treatable"
+
+This is a crisis situation. Be comprehensive, warm, and include specific actionable help. Keep it conversational for voice but thorough.`;
+        
+        const crisisResult = await genTextFromGemini(crisisPrompt, 3);
+        crisisResponse = crisisResult.text.trim();
+      } catch (err) {
+        console.warn("Voice crisis AI response failed, using fallback", err);
+        crisisResponse = `I hear the pain in your words when you say "${transcript}". I'm so sorry you're going through this, and I want you to know that you're not alone right now - I'm here with you. It takes incredible courage to reach out when you're feeling this way. 
+
+If you're in immediate danger or feel you might harm yourself, please reach out for help right now:
+• **Call or text 988** for the Suicide & Crisis Lifeline (US/Canada, available 24/7)
+• **Call 111** for urgent mental health support (UK)
+• **Call 116 123** for Samaritans (UK, available 24/7)
+• **Text HOME to 741741** for the Crisis Text Line (available 24/7)
+
+These feelings, even though they're incredibly overwhelming, are treatable, and there are people who want to help you through this. Can you tell me more about what you're feeling right now? I'm listening, and I'm not going anywhere.`;
+      }
+
+      if (!crisisResponse) {
+        crisisResponse = `I hear you when you say "${transcript}". Your life has value and you matter deeply. I'm so sorry you're going through this pain right now.
+
+Please reach out for immediate help:
+• **Call or text 988** - Suicide & Crisis Lifeline (US/Canada, 24/7)
+• **Call 111** - UK urgent mental health support
+• **Call 116 123** - Samaritans (UK, 24/7) 
+• **Text HOME to 741741** - Crisis Text Line (24/7)
+
+You're not alone in this. These feelings are treatable, and there are people waiting to help you. I'm here to talk with you. What's happening right now?`;
+      }
+
+      // Save crisis response as assistant message (same as text processing)
+      await db.collection("users").doc(userId).collection("chats").add({
+        role: "assistant",
+        text: crisisResponse,
+        created_at: new Date(),
+        meta: { 
+          automated: true, 
+          risk: "high", 
+          responseModel: "voice-crisis-ai",
+          processedBy: "processVoice",
+          emotion: emotionData,
+          emotionModel: emotionModel,
+          tts: false // TTS will be generated below
+        },
+      });
+      
+      // Save crisis alert (same as text processing)
+      await db.collection("users").doc(userId).collection("alerts").add({
+        severity: "high",
+        reason: "AI detected crisis from audio",
+        message: transcript,
+        created_at: new Date(),
+        meta: { emotion: emotionData },
+      });
+      
+      // Generate TTS for crisis response
+      console.log("Starting TTS generation for crisis response...");
+      synthesizeAudioBase64(crisisResponse)
+        .then(audioBase64 => {
+          console.log("Crisis TTS generation completed");
+          // Could save audio to storage or cache if needed
+        })
+        .catch(ttsErr => {
+          console.warn("Crisis TTS generation failed:", ttsErr);
+        });
+      
+      // Return crisis response immediately (same as text processing)
+      return res.json({
+        ok: true,
+        transcript,
+        assistantText: crisisResponse,
+        assistantAudio: null, // TTS generated in background
+        emotion: emotionData,
+        crisis: true, // Flag to indicate crisis response
+        models: {
+          emotion: emotionModel,
+          response: "voice-crisis-ai"
+        },
+        performance: {
+          crisisMode: true,
+          ttsAsync: true
+        }
+      });
+    }
+
+    // 5) Save assistant message immediately (TTS will be generated async if needed)
+    console.log("Saving assistant response to database...");
+
+    const assistantMeta = { 
+      automated: true, 
+      processedBy: "processVoice", 
+      emotion: emotionData,
+      emotionModel: emotionModel,
+      responseModel: aiResponseModel,
+      contextStrategy: responseModel, // tracks response type (basic-voice, enhanced-voice-context, etc.)
+      contextLoaded: Object.keys(contextData), // shows what specific data was loaded
+      intentDetection: "ai-powered", // indicates AI was used for intent detection
+      detectedIntents: intentResult, // shows what the AI detected from voice
+      tts: false // TTS will be generated in background
+    };
+    
+    // Add high-risk flag for voice crisis messages (use same logic as crisis detection)
+    if (shouldTriggerCrisis) {
+      assistantMeta.risk = "high";
+    }
+    
+    await db
+      .collection("users")
+      .doc(userId)
+      .collection("chats")
+      .add({
+        role: "assistant",
+        text: assistantText,
+        created_at: new Date(),
+        meta: assistantMeta,
+      });
+
+    // 8) Generate TTS in background (don't wait for it)
+    console.log("Starting TTS generation in background...");
+    synthesizeAudioBase64(assistantText)
+      .then(audioBase64 => {
+        console.log("TTS generation completed, audio ready for playback");
+        // Could save audio to storage or cache if needed
+      })
+      .catch(ttsErr => {
+        console.warn("TTS generation failed (background):", ttsErr);
+      });
+
+    // 9) Return response immediately (without waiting for TTS)
+    return res.json({
+      ok: true,
+      transcript,
+      assistantText,
+      assistantAudio: null, // TTS generated in background
+      emotion: emotionData,
+      models: {
+        emotion: emotionModel,
+        response: aiResponseModel
+      },
+      performance: {
+        fastMode: true,
+        ttsAsync: true
+      }
+    });
+  } catch (err) {
+    console.error("processVoice error:", err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// ----------------- Keep onChatMessage but skip voice-processed docs -----------------
+// If you already have an onChatMessage trigger, add the first guard to avoid duplicate reply
+exports.onChatMessage = onDocumentCreated(
+  {
+    document: "users/{userId}/chats/{messageId}",
+    region: "asia-south1",
+  },
+  async (event) => {
+    const data = event.data.data();
+    const { userId } = event.params;
+    if (!data || data.role !== "user") return;
+
+    // IMPORTANT: skip messages already processed by processVoice or voice uploads
+    if (data.meta?.processedBy === "processVoice" || data.meta?.processedBy === "voiceUpload") {
+      console.log("onChatMessage: skipping voice-processed message");
+      return;
+    }
+
+    // Skip voice messages without text content
+    if (data.type === "voice" && !data.text) {
+      console.log("onChatMessage: skipping voice message without transcription");
+      return;
+    }
+
+    const userMsg = data.text || "";
+    
+    // Skip if no actual text content
+    if (!userMsg || userMsg.trim() === "" || userMsg === "undefined") {
+      console.log("onChatMessage: skipping message with no text content");
+      return;
+    }
+    
+    console.log("🔥 User said:", userMsg);
+    
+    // Debug: Immediate crisis check for text
+    const immediateTextKeywordCheck = RISK_KEYWORDS.find((k) => userMsg.toLowerCase().includes(k));
+    if (immediateTextKeywordCheck) {
+      console.log(`🚨 IMMEDIATE CRISIS DETECTED in text: "${immediateTextKeywordCheck}" from message: "${userMsg}"`);
+    }
+
+    try {
+      // --- 1. Parallel processing: Moderation + Emotion Analysis ---
+      console.log("Starting parallel text analysis: moderation + emotion...");
+      
+      const moderationPromise = (async () => {
+        try {
+          const moderationPrompt = `Classify this message for self-harm or suicide risk.
+             Respond ONLY with one word: high or safe.
+             Message: "${userMsg}"`;
+          const moderationResult = await genTextFromGemini(moderationPrompt, 2);
+
+          let riskLevel = moderationResult?.text?.toLowerCase().trim() || "safe";
+          if (!["high", "safe"].includes(riskLevel)) riskLevel = "safe";
+          return riskLevel;
+        } catch (err) {
+          console.error("⚠️ Gemini moderation failed:", err);
+          // Enhanced keyword matching with logging
+          const userMsgLower = userMsg.toLowerCase();
+          const matchedKeyword = RISK_KEYWORDS.find((k) => userMsgLower.includes(k));
+          const isHighRisk = !!matchedKeyword;
+          
+          if (matchedKeyword) {
+            console.log(`🚨 CRISIS KEYWORD DETECTED: "${matchedKeyword}" in message: "${userMsg}"`);
+          }
+          
+          return isHighRisk ? "high" : "safe";
+        }
+      })();
+      
+      const emotionPromise = (async () => {
+        const emoPrompt = `You are an emotion detection AI. Analyze this message and respond with ONLY valid JSON:
+
+{"emotion": "<emotion>", "intensity": <number>, "notes": "<brief reason>"}
+
+Emotion categories: happy, sad, anxious, angry, excited, frustrated, depressed, suicidal, neutral
+Intensity: 0-100 (0=barely detectable, 100=extremely intense)
+
+Examples:
+- "I am very happy" → {"emotion": "happy", "intensity": 85, "notes": "clearly expressing happiness"}
+- "I feel okay" → {"emotion": "neutral", "intensity": 30, "notes": "mild positive sentiment"}
+- "I want to die" → {"emotion": "suicidal", "intensity": 95, "notes": "crisis situation"}
+
+Analyze: "${userMsg}"`;
+        let emotionData = { emotion: "neutral", intensity: 0, notes: "" };
+        let emotionModel = "keyword-fallback";
+        
+        try {
+          const emoResult = await genTextFromGemini(emoPrompt, 2);
+          emotionModel = emoResult.model;
+          try {
+            const parsed = JSON.parse(emoResult.text);
+            // Normalize emotion labels (same as voice processing)
+            const e = (parsed.emotion || '').toLowerCase();
+            const map = {
+              joyful: 'happy', joy: 'happy', pleased: 'happy', delighted: 'happy', glad: 'happy',
+              unhappy: 'sad', sorrow: 'sad', down: 'sad',
+              nervous: 'anxious', worried: 'anxious', stressed: 'anxious',
+              mad: 'angry', upset: 'angry', irritated: 'angry', frustrated: 'frustrated',
+              excited: 'excited', thrilled: 'excited',
+              depressed: 'depressed', hopeless: 'depressed',
+              suicidal: 'suicidal', selfharm: 'suicidal', 'self-harm': 'suicidal'
+            };
+            const normalized = map[e] || e;
+            emotionData = {
+              emotion: ['happy','sad','anxious','angry','excited','frustrated','depressed','suicidal','neutral'].includes(normalized) ? normalized : 'neutral',
+              intensity: Math.max(0, Math.min(100, Number(parsed.intensity ?? 50))),
+              notes: parsed.notes || ''
+            };
+            // Boost intensity for strong positive language
+            const positiveBoost = /(very|so|extremely)\s+(happy|glad|excited|good|great)/i.test(userMsg);
+            if (emotionData.emotion === 'happy' && positiveBoost && emotionData.intensity < 70) {
+              emotionData.intensity = 80;
+              emotionData.notes = emotionData.notes || 'strong positive language detected';
+            }
+          } catch (parseErr) {
+            // Keyword fallback with positive detection
+            const t = userMsg.toLowerCase();
+            const crisisHit = RISK_KEYWORDS.some((k) => t.includes(k));
+            if (crisisHit) {
+              emotionData = { emotion: 'suicidal', intensity: 95, notes: 'Crisis keywords detected' };
+            } else if (/\b(happy|glad|excited|great|amazing)\b/.test(t)) {
+              const booster = /(very|so|extremely)/.test(t) ? 85 : 70;
+              emotionData = { emotion: 'happy', intensity: booster, notes: 'Positive sentiment keywords' };
+            } else {
+              emotionData = { emotion: 'neutral', intensity: 40, notes: 'Parse failed' };
+            }
+          }
+        } catch (err) {
+          // Quick keyword check without AI
+          const t = userMsg.toLowerCase();
+          const crisisHit = RISK_KEYWORDS.some((k) => t.includes(k));
+          if (crisisHit) {
+            emotionData = { emotion: "suicidal", intensity: 95, notes: "keyword match" };
+            emotionModel = "crisis-keyword-fallback";
+          } else if (/\b(very|so|extremely)\s+(happy|glad|excited|good|great)/i.test(userMsg)) {
+            emotionData = { emotion: "happy", intensity: 85, notes: "strong positive keywords" };
+            emotionModel = "positive-keyword-fallback";
+          } else if (/\b(happy|glad|excited|great|amazing|wonderful|fantastic|awesome|love|enjoy)/i.test(userMsg)) {
+            emotionData = { emotion: "happy", intensity: 70, notes: "positive keywords" };
+            emotionModel = "positive-keyword-fallback";
+          } else if (/\b(sad|depressed|down|awful|terrible|horrible|hate|upset|crying)/i.test(userMsg)) {
+            emotionData = { emotion: "sad", intensity: 70, notes: "negative keywords" };
+            emotionModel = "negative-keyword-fallback";
+          } else {
+            emotionData = { emotion: "neutral", intensity: 30, notes: "AI failed, no clear emotional indicators" };
+            emotionModel = "error-fallback";
+          }
+        }
+        return { emotionData, emotionModel };
+      })();
+      
+      // Wait for both moderation and emotion analysis
+      const [riskLevel, emotionResult] = await Promise.all([moderationPromise, emotionPromise]);
+      const { emotionData, emotionModel } = emotionResult;
+
+      // --- 2. Enhanced crisis detection (same logic as voice processing) ---
+      const riskLabels = ["suicide", "suicidal", "kill", "kill myself", "die", "death", "hopeless"];
+      const crisisEmotions = ["suicidal", "depressed", "hopeless"];
+      const isHighRiskKeyword = riskLevel === "high";
+      const isCrisisEmotion = emotionData.emotion && crisisEmotions.includes(emotionData.emotion.toLowerCase());
+      
+      // Crisis support only for:
+      // 1. Messages flagged as high-risk by moderation AI (isHighRiskKeyword)
+      // 2. Suicidal/depressed emotions with high intensity (>= 80)
+      // 3. Any emotion with extremely high crisis intensity (>= 95)
+      const shouldTriggerCrisis = isHighRiskKeyword || 
+                                 (isCrisisEmotion && emotionData.intensity >= 80) ||
+                                 (emotionData.intensity >= 95);
+      
+      if (shouldTriggerCrisis) {
+        console.log(`🚨 HIGH RISK DETECTED for user ${userId}: "${userMsg}"`);
+        console.log(`Crisis triggers: keyword=${isHighRiskKeyword}, crisisEmotion=${isCrisisEmotion}, extremeIntensity=${emotionData.intensity >= 95}`);
+        console.log(`Emotion: ${emotionData.emotion} (intensity: ${emotionData.intensity})`);
+
+        // Generate personalized crisis response using AI
+        let crisisResponse = "";
+        try {
+          const crisisPrompt = `You are a crisis counselor responding to someone in distress. The person said: "${userMsg}"
+
+Provide a comprehensive, compassionate crisis response that:
+1. Opens with warmth and acknowledgment of their courage to reach out
+2. Validates their pain without judgment - acknowledge how much they're hurting
+3. Provide specific crisis resources:
+   - **988** for US/Canada Suicide & Crisis Lifeline (available 24/7)
+   - **111** for UK urgent mental health support  
+   - **116 123** for Samaritans in UK (available 24/7)
+   - Crisis Text Line: text HOME to 741741 (available 24/7)
+4. Emphasize that these feelings are treatable and there are people who want to help
+5. Ask a gentle, caring follow-up question to keep them talking
+6. Reassure them they're not alone and that you're here to listen
+7. Include phrases like "I'm so sorry you're going through this" and "These feelings, even though they're overwhelming, are treatable"
+8. Be comprehensive but still conversational - this is written text communication
+
+This is a crisis situation. Be thorough, warm, and include specific actionable help.`;
+          
+          const crisisResult = await genTextFromGemini(crisisPrompt, 3);
+          crisisResponse = crisisResult.text.trim();
+        } catch (err) {
+          console.warn("Crisis AI response failed, using fallback", err);
+          crisisResponse = `I hear the pain in your words when you say "${userMsg}". I'm so sorry you're going through this, and I want you to know that you're not alone right now - I'm here with you. It takes incredible courage to reach out when you're feeling this way.
+
+If you're in immediate danger or feel you might harm yourself, please reach out for help right now:
+• **Call or text 988** for the Suicide & Crisis Lifeline (US/Canada, available 24/7)
+• **Call 111** for urgent mental health support (UK)
+• **Call 116 123** for Samaritans (UK, available 24/7) 
+• **Text HOME to 741741** for the Crisis Text Line (available 24/7)
+
+These feelings, even though they're incredibly overwhelming, are treatable, and there are people who want to help you through this. Can you tell me more about what you're feeling right now? I'm listening, and I'm not going anywhere.`;
+        }
+
+        if (!crisisResponse) {
+          crisisResponse = `I hear you when you say "${userMsg}". Your life has value and you matter deeply. I'm so sorry you're going through this pain right now.
+
+Please reach out for immediate help:
+• **Call or text 988** - Suicide & Crisis Lifeline (US/Canada, 24/7)
+• **Call 111** - UK urgent mental health support
+• **Call 116 123** - Samaritans (UK, 24/7)
+• **Text HOME to 741741** - Crisis Text Line (24/7)
+
+You're not alone in this. These feelings are treatable, and there are people waiting to help you. I'm here to talk with you. What's happening right now?`;
+        }
+
+        // Crisis reply with AI-generated response + emotion metadata
+        await db.collection("users").doc(userId).collection("chats").add({
+          role: "assistant",
+          text: crisisResponse,
+          created_at: new Date(),
+          meta: { 
+            automated: true, 
+            risk: "high", 
+            responseModel: "crisis-ai",
+            emotion: emotionData,
+            emotionModel: emotionModel
+          },
+        });
+
+        // Save alert in Firebase with emotion data
+        await db.collection("users").doc(userId).collection("alerts").add({
+          severity: "high",
+          reason: "AI flagged high-risk chat message",
+          message: userMsg,
+          chat_id: event.params.messageId,
+          created_at: new Date(),
+          meta: { emotion: emotionData },
+        });
+
+        return;
+      }
+
+      // --- 3. AI-POWERED INTENT DETECTION: Smart context loading ---
+      console.log('🤖 Using AI to analyze what context is needed...');
+      
+      // Use AI to detect user intent and what data they need
+      let intentResult = {
+        needsAssessments: false,
+        needsMoods: false, 
+        needsAppointments: false,
+        needsAlerts: false,
+        needsSummary: false,
+        needsProfile: false
+      };
+      
+      try {
+        const intentPrompt = `You are an intent detection system for a mental health app. Analyze the user's message and determine what data they need.
+
+RESPOND WITH ONLY THIS EXACT JSON FORMAT (no extra text):
+{"needsAssessments": false, "needsMoods": false, "needsAppointments": false, "needsAlerts": false, "needsSummary": false, "needsProfile": false}
+
+Set to true if user needs:
+- needsAssessments: asking about test scores, PHQ-9, GAD-7, assessments, results, progress, "how am I doing"
+- needsMoods: asking about feelings, emotions, mood tracking, "how have I felt"
+- needsAppointments: asking about therapy sessions, counselor meetings, scheduling
+- needsAlerts: asking about crisis history, previous emergencies
+- needsSummary: asking for overall summary, overview, progress report, "how am I overall", "give me a summary"
+- needsProfile: asking about personal information, "what's my name", "what are my interests", "tell me about myself"
+
+Examples:
+"Show my test results" → {"needsAssessments": true, "needsMoods": false, "needsAppointments": false, "needsAlerts": false, "needsSummary": false, "needsProfile": false}
+"How have my moods been?" → {"needsAssessments": false, "needsMoods": true, "needsAppointments": false, "needsAlerts": false, "needsSummary": false, "needsProfile": false}
+"When's my appointment?" → {"needsAssessments": false, "needsMoods": false, "needsAppointments": true, "needsAlerts": false, "needsSummary": false, "needsProfile": false}
+"What's my name?" → {"needsAssessments": false, "needsMoods": false, "needsAppointments": false, "needsAlerts": false, "needsSummary": false, "needsProfile": true}
+"What are my interests?" → {"needsAssessments": false, "needsMoods": false, "needsAppointments": false, "needsAlerts": false, "needsSummary": false, "needsProfile": true}
+"Give me a summary of my progress" → {"needsAssessments": false, "needsMoods": false, "needsAppointments": false, "needsAlerts": false, "needsSummary": true, "needsProfile": false}
+"Hi there!" → {"needsAssessments": false, "needsMoods": false, "needsAppointments": false, "needsAlerts": false, "needsSummary": false, "needsProfile": false}
+
+User message: "${userMsg}"`;
+        
+        const intentAI = await genTextFromGemini(intentPrompt, 2);
+        console.log('🤖 Raw AI intent response:', intentAI.text);
+        
+        // Clean the response - remove any extra text before/after JSON
+        let cleanJson = intentAI.text.trim();
+        const jsonStart = cleanJson.indexOf('{');
+        const jsonEnd = cleanJson.lastIndexOf('}') + 1;
+        if (jsonStart !== -1 && jsonEnd > jsonStart) {
+          cleanJson = cleanJson.substring(jsonStart, jsonEnd);
+        }
+        
+        console.log('🤖 Cleaned JSON:', cleanJson);
+        const parsed = JSON.parse(cleanJson);
+        
+        intentResult = {
+          needsAssessments: !!parsed.needsAssessments,
+          needsMoods: !!parsed.needsMoods,
+          needsAppointments: !!parsed.needsAppointments, 
+          needsAlerts: !!parsed.needsAlerts,
+          needsSummary: !!parsed.needsSummary,
+          needsProfile: !!parsed.needsProfile
+        };
+        
+        console.log('✅ AI intent detection result:', intentResult);
+        
+      } catch (err) {
+        console.warn('⚠️ AI intent detection failed, using keyword fallback:', err);
+        // Fallback to basic keyword detection if AI fails
+        intentResult = {
+          needsAssessments: /\b(assessment|test|score|result|phq|gad|exam)\b/i.test(userMsg),
+          needsMoods: /\b(mood|feeling|emotion|how.*feel|track)\b/i.test(userMsg),
+          needsAppointments: /\b(appointment|session|meeting|counselor|therapist|schedule)\b/i.test(userMsg),
+          needsAlerts: /\b(alert|crisis|emergency|help|urgent)\b/i.test(userMsg),
+          needsSummary: /\b(summary|overview|progress|overall|how.*doing|report)\b/i.test(userMsg),
+          needsProfile: /\b(name|interest|hobby|about me|who am i|my name|my interest)\b/i.test(userMsg)
+        };
+      }
+      
+      const { needsAssessments, needsMoods, needsAppointments, needsAlerts, needsSummary, needsProfile } = intentResult;
+      
+      // --- 4. ALWAYS load last 6 chats for better conversation flow ---
+      console.log('💬 Loading last 6 chats for conversational context...');
+      const chatContext = await getChatContext(userId);
+      
+      // Build context object with requested data
+      let contextData = { chats: chatContext };
+      let contextSections = [];
+      let responseModel = "basic";
+      let messages;
+      
+      // Check if specific data is needed beyond chat history
+      if (needsAssessments || needsMoods || needsAppointments || needsAlerts || needsSummary || needsProfile) {
+        console.log('📊 Loading specific context data...');
+        responseModel = "enhanced-context";
+        
+        // Load only what's needed in parallel
+        const promises = [];
+        
+        if (needsAssessments || needsSummary) {
+          console.log(needsAssessments ? '  - Loading assessments...' : '  - Loading assessments for summary...');
+          promises.push(
+            (async () => {
+              const profileContext = await getUserProfileContext(userId);
+              contextData.assessments = profileContext.assessmentSummary;
+              contextSections.push(`ASSESSMENT HISTORY: ${profileContext.assessmentSummary}`);
+            })()
+          );
+        }
+        
+        if (needsMoods || needsSummary) {
+          console.log(needsMoods ? '  - Loading moods...' : '  - Loading moods for summary...');
+          promises.push(
+            (async () => {
+              const profileContext = await getUserProfileContext(userId);
+              contextData.moods = profileContext.moodSummary;
+              contextSections.push(`RECENT MOODS: ${profileContext.moodSummary}`);
+            })()
+          );
+        }
+        
+        if (needsAppointments || needsSummary) {
+          console.log(needsAppointments ? '  - Loading appointments...' : '  - Loading appointments for summary...');
+          promises.push(
+            (async () => {
+              const profileContext = await getUserProfileContext(userId);
+              contextData.appointments = profileContext.appointmentsSummary;
+              contextSections.push(`APPOINTMENTS: ${profileContext.appointmentsSummary}`);
+            })()
+          );
+        }
+        
+        if (needsAlerts || needsSummary) {
+          console.log(needsAlerts ? '  - Loading alerts...' : '  - Loading alerts for summary...');
+          promises.push(
+            (async () => {
+              const profileContext = await getUserProfileContext(userId);
+              contextData.alerts = profileContext.alertSummary;
+              contextSections.push(`CRISIS ALERTS: ${profileContext.alertSummary}`);
+            })()
+          );
+        }
+        
+        if (needsProfile || needsSummary) {
+          console.log(needsProfile ? '  - Loading profile information...' : '  - Loading profile for summary...');
+          promises.push(
+            (async () => {
+              const profileContext = await getUserProfileContext(userId);
+              contextData.profile = profileContext.profileSummary;
+              contextSections.push(`PERSONAL PROFILE: ${profileContext.profileSummary}`);
+            })()
+          );
+        }
+        
+        // Wait for all requested data
+        await Promise.all(promises);
+        
+        const contextString = contextSections.join('\n\n');
+        
+        if (needsSummary) {
+          responseModel = "comprehensive-summary";
+          messages = `
+You are a mental health counselor providing a comprehensive summary of a student's progress.
+
+CURRENT MESSAGE: "${userMsg}"
+CURRENT EMOTION: ${emotionData.emotion} (${emotionData.intensity}% intensity)
+
+COMPREHENSIVE USER DATA:
+${contextString}
+
+RECENT CONVERSATIONS: ${chatContext}
+
+Student: ${userMsg}
+
+PROVIDE A COMPREHENSIVE SUMMARY:
+1. Overall mental health progress and trends
+2. Assessment scores and improvements/declines
+3. Mood patterns and emotional well-being
+4. Crisis alerts or concerning patterns
+5. Appointment attendance and engagement
+6. Key insights and recommendations
+7. Be supportive and encouraging while being honest about progress
+8. IMPORTANT: Use the emotion data to inform your tone and approach, but don't explicitly mention emotions or percentages unless directly relevant
+
+Counselor:`;
+        } else {
+          messages = `
+You are a supportive mental health counselor with access to the student's conversation history and requested data.
+
+CURRENT MESSAGE: "${userMsg}"
+CURRENT EMOTION: ${emotionData.emotion} (${emotionData.intensity}% intensity)
+
+RELEVANT USER DATA:
+${contextString}
+
+RECENT CONVERSATIONS: ${chatContext}
+
+Student: ${userMsg}
+
+RESPONSE INSTRUCTIONS:
+1. Use the conversation history to maintain continuity and reference previous discussions
+2. Use the provided relevant data to answer their specific question
+3. Be specific and direct - if they ask for scores, provide exact scores and dates
+4. Be supportive while providing the requested information
+5. Use emotion data to adjust your tone - be more gentle if they're distressed, but don't mention specific emotions or percentages
+6. Reference previous conversations when relevant
+7. Keep responses natural and conversational - avoid clinical language about emotions
+
+Counselor:`;
+        }
+
+      } else {
+        console.log('💬 Using conversational response with chat history...');
+        responseModel = "conversational";
+        
+        messages = `
+You are a supportive mental health counselor for students with access to recent conversation history.
+
+CURRENT MESSAGE: "${userMsg}"
+CURRENT EMOTION: ${emotionData.emotion} (${emotionData.intensity}% intensity)
+
+RECENT CONVERSATION HISTORY: ${chatContext}
+
+Student: ${userMsg}
+
+Provide a warm, supportive response that:
+1. References previous conversations when relevant for continuity
+2. Uses emotion data to inform your tone and approach (be gentle if they seem distressed)
+3. Offers encouragement and validation
+4. Asks thoughtful follow-up questions
+5. Shows empathy and understanding
+6. Maintains the flow of your ongoing conversation
+7. IMPORTANT: Don't explicitly mention emotions, percentages, or intensity levels - just let them inform your response naturally
+
+Counselor:`;
+      }
+
+      // --- 4. Generate reply from Gemini ---
+      let aiText = "";
+      let textResponseModel = "fallback";
+      try {
+        const textResult = await genTextFromGemini(messages, 3);
+        aiText = textResult.text.trim();
+        textResponseModel = textResult.model;
+      } catch (err) {
+        console.error("❌ Gemini error:", err);
+        if (err.message.includes('overloaded')) {
+          aiText = "I'm experiencing high demand right now, but I'm here to listen. What would you like to talk about?";
+          textResponseModel = "overloaded-fallback";
+        } else {
+          textResponseModel = "error-fallback";
+        }
+      }
+
+      if (!aiText) {
+        aiText = "I'm listening — tell me more about what's on your mind.";
+        textResponseModel = "empty-fallback";
+      }
+
+      // --- 5. Update user message with emotion data ---
+      try {
+        const userMessageRef = db.collection("users").doc(userId).collection("chats").doc(event.params.messageId);
+        await userMessageRef.update({
+          'meta.emotion': emotionData,
+          'meta.emotionModel': emotionModel,
+          'meta.processedBy': 'onChatMessage'
+        });
+        console.log("✨ Updated user message with emotion data");
+      } catch (updateErr) {
+        console.warn("Failed to update user message with emotion data:", updateErr);
+      }
+
+      // --- 6. Save assistant reply with optimized metadata ---
+      await db.collection("users").doc(userId).collection("chats").add({
+        role: "assistant",
+        text: aiText,
+        created_at: new Date(),
+        meta: { 
+          automated: true, 
+          source: "gemini",
+          responseModel: textResponseModel,
+          contextStrategy: responseModel, // tracks if we loaded specific data or went general
+          contextLoaded: Object.keys(contextData), // shows what specific data was loaded
+          intentDetection: "ai-powered", // indicates AI was used for intent detection
+          detectedIntents: intentResult, // shows what the AI detected
+          emotion: emotionData,
+          emotionModel: emotionModel
+        },
+      });
+
+      console.log("✅ Reply saved for user:", userId);
+    } catch (err) {
+      console.error("❌ Error in onChatMessage:", err);
+
+      await db.collection("users").doc(userId).collection("chats").add({
+        role: "assistant",
+        text: "Sorry, I wasn’t able to respond just now. Can you try again?",
+        created_at: new Date(),
+        meta: { automated: true, error: true },
+      });
+    }
+  }
+);

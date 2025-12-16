@@ -1,0 +1,85 @@
+// Firestore Security Rules for CampusCare
+// Copy these rules to Firebase Console > Firestore Database > Rules
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Users can read/write their own user document
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+      
+      // Users can read/write their own chats
+      match /chats/{chatId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      
+      // Users can read/write their own assessments
+      match /assessments/{assessmentId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      
+      // Users can read/write their own mood entries
+      match /mood_entries/{moodId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      
+      // Users can read/write their own notifications
+      match /notifications/{notificationId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      
+      // Users can read/write their own crisis alerts
+      match /crisis_alerts/{alertId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      
+      // Users can read/write their own appointments
+      match /appointments/{appointmentId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+    }
+    
+    // Support groups - authenticated users can read and join
+    match /support_groups/{groupId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null;
+      
+      match /members/{memberId} {
+        allow read, write: if request.auth != null;
+      }
+      
+      match /messages/{messageId} {
+        allow read, write: if request.auth != null;
+      }
+    }
+    
+    // Counselors can read user data (for student-counselor relationships)
+    match /users/{userId} {
+      allow read: if request.auth != null && 
+        (request.auth.uid == userId || 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'counselor');
+    }
+    
+    // Global resources - all authenticated users can read
+    match /resources/{resourceId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'counselor';
+    }
+  }
+}
+
+
+// HOW TO APPLY THESE RULES:
+// 1. Go to Firebase Console (https://console.firebase.google.com)
+// 2. Select your "campuscare-45120" project
+// 3. Go to Firestore Database
+// 4. Click on "Rules" tab
+// 5. Replace the existing rules with the rules above
+// 6. Click "Publish"
+
+// IMPORTANT NOTES:
+// - These rules ensure users can only access their own data
+// - Counselors can read student data (for counseling purposes)  
+// - All users can access support groups and resources
+// - Make sure you have user documents with role field set properly
