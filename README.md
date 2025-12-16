@@ -1,6 +1,8 @@
 # CampusCare - Digital Mental Health Support Platform
 
-> 🧠 **Smart India Hackathon Project**: A comprehensive digital mental health and psychological support system for students in higher education.
+![alt text](<public/Screenshot 2025-12-16 at 7.17.15 PM.png>)
+
+> 🧠 **Hackathon Project**: A comprehensive digital mental health and psychological support system for students in higher education.
 
 [![React](https://img.shields.io/badge/React-19.1.1-blue.svg)](https://reactjs.org/)
 [![Firebase](https://img.shields.io/badge/Firebase-12.2.1-orange.svg)](https://firebase.google.com/)
@@ -140,4 +142,4 @@ firebase deploy --only functions
 
 **⚠️ Disclaimer**: This platform provides supportive resources and should not replace professional mental health treatment. In emergencies, contact local crisis services immediately.
 
-**Built with ❤️ for student mental health and well-being - Smart India Hackathon 2024**
+**Built with ❤️ for student mental health and well-being -**
